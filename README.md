@@ -184,6 +184,23 @@ The parity fixtures in `tests/fixtures/` were recorded from the Python SDK by
 `scripts/make_fixtures.py` (`pip install laya`, then run it). Regenerate them if the upstream
 checkpoint changes.
 
+## Releasing
+
+Pushing a `v*` tag (or running the Release workflow with a bump type) builds,
+tests, and publishes binaries for macOS (Apple Silicon and Intel, Metal) and
+Linux (x86_64 and ARM64, CPU) with a SHA-256 checksum file.
+
+Linux releases are CPU-only. CUDA needs a local NVIDIA toolkit, so build that
+yourself with `--features cuda`.
+
+The macOS binaries are codesigned, and notarized, when the Apple secrets are
+configured on the repository; without them the release still goes out, just
+unsigned. See [docs/macos-signing.md](docs/macos-signing.md) for which
+certificate to get and which secrets to set.
+
+For the first release, push `v0.1.0` (the version already in `Cargo.toml`) rather
+than bumping from a missing tag.
+
 ## How it works
 
 - `src/hub.rs` fetches `rl_agent_config.json`, `encoder/config.json`, the tokenizer files, and
