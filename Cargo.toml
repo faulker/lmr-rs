@@ -1,0 +1,48 @@
+[package]
+name = "laya-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust inference server for the Laya System One decision model"
+license = "Apache-2.0"
+
+[lib]
+name = "laya_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "laya-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+clap = { version = "4", features = ["derive"] }
+hf-hub = { version = "1", features = ["blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokenizers = "0.23"
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "1"
+rcgen = "0.14"
+subtle = "2"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "json"] }
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+
+[profile.release]
+opt-level = 3

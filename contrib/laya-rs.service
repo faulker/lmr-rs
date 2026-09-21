@@ -1,0 +1,14 @@
+[Unit]
+Description=laya-rs System One inference server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={{BIN}} serve --config {{CONFIG}}
+Restart=on-failure
+RestartSec=5
+# The checkpoint is memory mapped from the Hugging Face cache; keep the environment simple.
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=default.target
