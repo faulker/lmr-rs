@@ -88,14 +88,12 @@ jobs:
             runner: macos-latest
             target: aarch64-apple-darwin
             features: metal
-          - name: macOS x86_64 (Intel)
-            runner: macos-latest
-            target: x86_64-apple-darwin
-            features: metal
           - name: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: ""
+          # candle/gemm emits NEON fp16 kernels; rustc will not assemble them
+          # unless FEAT_FP16 is on. .cargo/config.toml sets that for this target.
           - name: Linux ARM64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -113,7 +111,7 @@ jobs:
       - name: Cache cargo registry and build output
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ matrix.features }}
+          key: ${{ matrix.target }}-${{ matrix.features }}-v2
 
       # Stamp the release version into Cargo.toml before building so
       # CARGO_PKG_VERSION matches the tag. Do not commit here: the release

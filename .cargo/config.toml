@@ -1,0 +1,5 @@
+# candle's gemm-f16 crate emits NEON fp16 kernels (`fmla`/`fadd`/`fmul` `.8h`).
+# rustc will not assemble those unless FEAT_FP16 is enabled on the target.
+# Ampere Altra, Graviton2+, and other ARMv8.2 cloud CPUs have it.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]

@@ -1,9 +1,9 @@
 # Signing the macOS release binaries
 
 The release workflow (`.github/workflows/release.yml`) codesigns and optionally
-notarizes the two macOS binaries. Everything is opt-in: when the secrets below
-are missing, the macOS jobs still build, test, and publish, they just ship
-unsigned binaries. So you can add the certificate first and notarization later.
+notarizes the macOS binary. Everything is opt-in: when the secrets below are
+missing, the macOS job still builds, tests, and publishes, it just ships an
+unsigned binary. So you can add the certificate first and notarization later.
 
 Signing happens after `cargo build` and before the tarball is created, so the
 `checksums-sha256.txt` published with the release covers the signed binary.

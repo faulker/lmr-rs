@@ -187,13 +187,14 @@ checkpoint changes.
 ## Releasing
 
 Pushing a `v*` tag (or running the Release workflow with a bump type) builds,
-tests, and publishes binaries for macOS (Apple Silicon and Intel, Metal) and
-Linux (x86_64 and ARM64, CPU) with a SHA-256 checksum file.
+tests, and publishes binaries for macOS Apple Silicon (Metal) and Linux
+(x86_64 and ARM64, CPU) with a SHA-256 checksum file. The Linux ARM64 build
+needs ARMv8.2 FP16 (Graviton2+, Ampere), which candle's gemm kernels require.
 
 Linux releases are CPU-only. CUDA needs a local NVIDIA toolkit, so build that
 yourself with `--features cuda`.
 
-The macOS binaries are codesigned, and notarized, when the Apple secrets are
+The macOS binary is codesigned, and notarized, when the Apple secrets are
 configured on the repository; without them the release still goes out, just
 unsigned. See [docs/macos-signing.md](docs/macos-signing.md) for which
 certificate to get and which secrets to set.
