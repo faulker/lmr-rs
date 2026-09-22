@@ -1,6 +1,6 @@
 [package]
 name = "lmr-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Native Rust inference server for local models, starting with Laya System One"
 license = "Apache-2.0"
