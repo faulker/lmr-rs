@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lmr-rs</title>
+    <link rel="stylesheet" href="/web/app.css" />
+  </head>
+  <body>
+    <div id="gate" hidden>
+      <p class="mark">lmr</p>
+      <h1>The console is locked.</h1>
+      <form id="login-form">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <p id="login-error" class="error" role="alert" hidden></p>
+        <button type="submit">Continue</button>
+      </form>
+    </div>
+
+    <div id="app" hidden>
+      <header class="top">
+        <p class="mark">lmr</p>
+        <p id="meta" class="meta"></p>
+        <p id="lock" class="lock"></p>
+        <button id="logout" type="button" class="text-btn" hidden>Lock</button>
+      </header>
+
+      <main class="spread">
+        <section class="compose" aria-labelledby="compose-heading">
+          <div class="pane-head">
+            <h2 id="compose-heading">Request</h2>
+            <div class="chips" role="group" aria-label="Examples">
+              <button type="button" class="chip" data-example="spam">Spam</button>
+              <button type="button" class="chip" data-example="urgency">Urgency</button>
+            </div>
+          </div>
+          <label class="sr-only" for="editor">Request JSON</label>
+          <textarea id="editor" spellcheck="false" autocapitalize="off"></textarea>
+          <p id="parse-error" class="error" role="status"></p>
+          <div class="actions">
+            <button type="button" id="format" class="ghost">Format</button>
+            <button type="button" id="submit">Decide</button>
+          </div>
+        </section>
+
+        <section class="result" aria-labelledby="result-heading" aria-live="polite">
+          <div class="pane-head">
+            <h2 id="result-heading">Verdict</h2>
+            <button type="button" id="toggle-json" class="text-btn" hidden>JSON</button>
+          </div>
+          <div id="empty" class="empty">
+            <p id="empty-copy">A System One document is <code>state</code> plus <code>questions</code>. Paste one, or load an example.</p>
+          </div>
+          <div id="working" class="working" hidden>
+            <p id="working-copy">Reading the document.</p>
+            <div class="working-rule" aria-hidden="true"></div>
+          </div>
+          <div id="fail" class="error" hidden></div>
+          <div id="verdict" hidden></div>
+          <pre id="raw" hidden></pre>
+        </section>
+      </main>
+    </div>
+
+    <script src="/web/app.js"></script>
+  </body>
+</html>

@@ -1,16 +1,16 @@
 [package]
-name = "laya-rs"
+name = "lmr-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Native Rust inference server for the Laya System One decision model"
+description = "Native Rust inference server for local models, starting with Laya System One"
 license = "Apache-2.0"
 
 [lib]
-name = "laya_rs"
+name = "lmr_rs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "laya-rs"
+name = "lmr-rs"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,6 +19,7 @@ candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
 clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
 hf-hub = { version = "1", features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -78,8 +78,8 @@ ticket up online using the signature's hash. Nothing about the published
 On a Mac that has never seen your certificate:
 
 ```sh
-codesign --verify --strict --verbose=2 ./laya-rs     # signature is intact
-spctl --assess --type execute -vv ./laya-rs          # Gatekeeper's verdict
+codesign --verify --strict --verbose=2 ./lmr-rs     # signature is intact
+spctl --assess --type execute -vv ./lmr-rs          # Gatekeeper's verdict
 ```
 
 `spctl` reporting `source=Notarized Developer ID` means both halves worked.

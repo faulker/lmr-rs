@@ -1,5 +1,5 @@
 [Unit]
-Description=laya-rs System One inference server
+Description=lmr-rs local model inference server
 After=network-online.target
 Wants=network-online.target
 

@@ -48,13 +48,14 @@ fn default_temperature() -> Vec<f32> {
 impl LayaConfig {
     /// Read and parse `rl_agent_config.json`.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Calibration temperature for a question with `k` options, mirroring `Agent.system_one`:
-    /// the option-count bucket wins, then the per type value, then 1.0.
+    /// the option-count bucket wins, then the per type value, then 1.0. The 11+ floor lives
+    /// on `DecidePolicy` (`model.choice_min_temperature`), not here.
     pub fn temperature_for(&self, qtype: QType, k: usize) -> f32 {
         if let Some(t) = self.temperature_by_options.get(&temp_bucket(qtype, k)) {
             return *t;
@@ -115,6 +116,10 @@ mod tests {
         assert_eq!(cfg.temperature_for(QType::Noul, 2), 1.9);
         assert_eq!(cfg.head_layers, 2);
         assert_eq!(cfg.max_len, 512);
+        let cfg: LayaConfig =
+            serde_json::from_str(r#"{"encoder":"x","temperature_by_options":{"choice:11+":0.1}}"#)
+                .unwrap();
+        assert!((cfg.temperature_for(QType::Choice, 22) - 0.1).abs() < 1e-6);
     }
 
     #[test]
@@ -129,8 +134,10 @@ mod tests {
         assert_eq!(out["local_rope_theta"], 10000.0);
         assert_eq!(out["pad_token_id"], 7);
         // Flat fields win when present and an explicit pad id is kept.
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"global_rope_theta":1.0,"local_rope_theta":2.0,"pad_token_id":3}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"global_rope_theta":1.0,"local_rope_theta":2.0,"pad_token_id":3}"#,
+        )
+        .unwrap();
         let out = normalize_encoder_config(v, 7);
         assert_eq!(out["global_rope_theta"], 1.0);
         assert_eq!(out["pad_token_id"], 3);

@@ -162,7 +162,8 @@ fn render_criterion(value: &Value) -> String {
 
 /// `None` or `""` mean "no description"; everything else, including `0` and `false`, counts.
 fn is_blank(value: Option<&Value>) -> bool {
-    matches!(value, None | Some(Value::Null)) || matches!(value, Some(Value::String(s)) if s.is_empty())
+    matches!(value, None | Some(Value::Null))
+        || matches!(value, Some(Value::String(s)) if s.is_empty())
 }
 
 /// Option texts in label order (`render_options`). Noul is always `[false, true]`.
@@ -247,8 +248,12 @@ impl Tok {
             .map_err(|e| anyhow!("loading {}: {e}", tokenizer_json.display()))?;
         let cfg: Option<Value> = match tokenizer_config {
             Some(p) => {
-                let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-                Some(serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?)
+                let text =
+                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+                Some(
+                    serde_json::from_str(&text)
+                        .with_context(|| format!("parsing {}", p.display()))?,
+                )
             }
             None => None,
         };
@@ -280,6 +285,20 @@ impl Tok {
             .encode(text, false)
             .map_err(|e| anyhow!("tokenizing: {e}"))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    /// Decode ids back to text, keeping special tokens. Used by tests to inspect packing.
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.inner
+            .decode(ids, false)
+            .map_err(|e| anyhow!("decoding: {e}"))
+    }
+
+    /// How many tokens `build_sequence` will spend on `state` before the length cap.
+    pub fn state_token_count(&self, state: &Value) -> Result<usize> {
+        Ok(self
+            .encode(&serialize_state(state).replace(&self.mask_token, " "))?
+            .len())
     }
 }
 
@@ -340,6 +359,25 @@ pub fn build_sequence(
     ids.truncate(max_len);
     markers.retain(|m| *m < max_len);
     Ok(Sequence { ids, markers })
+}
+
+/// Tokens to spend on instructions + options, given the sequence window and how long the
+/// state is. Python packing uses a fixed `head_max_len` (192). That leaves most of a 512-token
+/// window empty when the state is short, while 15+ options get squeezed to a handful of tokens
+/// and their descriptions never reach the model. Unused room is given to the head; a long
+/// state still gets the configured 192 so the Python parity cases match.
+pub fn packed_head_max_len(max_len: usize, head_max_len: usize, state_tokens: usize) -> usize {
+    let overhead = 4; // [CLS], [SEP] after instructions, [SEP] after options, final [SEP]
+    let from_room = max_len.saturating_sub(state_tokens.saturating_add(overhead));
+    from_room
+        .max(head_max_len)
+        .min(max_len.saturating_sub(overhead))
+}
+
+/// Token counts between consecutive option markers. The last option is omitted because its
+/// span runs into the state block.
+pub fn option_widths(markers: &[usize]) -> Vec<usize> {
+    markers.windows(2).map(|w| w[1] - w[0]).collect()
 }
 
 /// Calibration bucket name, e.g. `choice:6-10` (`temp_bucket`).
@@ -411,7 +449,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_options(&q).unwrap(),
-            vec!["Dining: Restaurants", "Gas", "Fees", "Zero: 0", r#"R: {"a": 1}"#]
+            vec![
+                "Dining: Restaurants",
+                "Gas",
+                "Fees",
+                "Zero: 0",
+                r#"R: {"a": 1}"#
+            ]
         );
         let q = Question::from_def(QType::Choice, &json!("x"), Some(&json!(["a", "b"]))).unwrap();
         assert_eq!(render_options(&q).unwrap(), vec!["a", "b"]);
@@ -421,13 +465,20 @@ mod tests {
     #[test]
     fn score_and_noul_options() {
         let q = Question::from_def(QType::Score, &json!("x"), Some(&json!(["bad", "ok"]))).unwrap();
-        assert_eq!(render_options(&q).unwrap(), vec!["level 0: bad", "level 1: ok"]);
+        assert_eq!(
+            render_options(&q).unwrap(),
+            vec!["level 0: bad", "level 1: ok"]
+        );
         let q = Question::from_def(QType::Noul, &json!("x"), None).unwrap();
         assert_eq!(
             render_options(&q).unwrap(),
-            vec!["false: no, the statement does not hold", "true: yes, the statement holds"]
+            vec![
+                "false: no, the statement does not hold",
+                "true: yes, the statement holds"
+            ]
         );
-        let q = Question::from_def(QType::Noul, &json!("x"), Some(&json!({"true": "it is"}))).unwrap();
+        let q =
+            Question::from_def(QType::Noul, &json!("x"), Some(&json!({"true": "it is"}))).unwrap();
         assert_eq!(render_options(&q).unwrap()[1], "true: it is");
     }
 
@@ -449,5 +500,133 @@ mod tests {
         let p = calibrated_softmax(&[2.0, 0.0], 1.0);
         assert!((p[0] + p[1] - 1.0).abs() < 1e-12);
         assert_eq!(round4(0.123456), 0.1235);
+    }
+
+    #[test]
+    fn packed_head_uses_unused_room_only_when_state_is_short() {
+        assert_eq!(packed_head_max_len(512, 192, 12), 496);
+        assert_eq!(packed_head_max_len(512, 192, 400), 192);
+        assert_eq!(packed_head_max_len(512, 192, 0), 508);
+        assert!(packed_head_max_len(512, 192, 12) > 192);
+    }
+}
+
+#[cfg(test)]
+mod packing_with_tokenizer {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn tok() -> Tok {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tokenizer");
+        Tok::load(
+            &dir.join("tokenizer.json"),
+            Some(&dir.join("tokenizer_config.json")),
+        )
+        .unwrap()
+    }
+
+    /// The 22-category payload from myphin: descriptions are long enough that Python packing
+    /// (head_max_len=192) squeezes each option to 8 tokens, so "grocery store" never reaches
+    /// Food. Giving the unused 512-token room to the head keeps those words.
+    fn costco_question() -> (Value, Question) {
+        let state = json!({"direction": "money out", "transactionTitle": "COSTO"});
+        let q = Question::from_def(
+            QType::Choice,
+            &json!("Which spending category does this bank transaction belong to? Pick other if none fits."),
+            Some(&json!({
+                "Alcohol": "Wine, wine bar, beer, liqure, bars",
+                "Auto": "Auto parts, auto insurance, auto registration, parking, tolls, or maintinance",
+                "Bills": "Any household or personal expense that such as storage unit rent, cell phone",
+                "Donation": null,
+                "Entertainment": "Music events, movie theater, amusement parks, zoos",
+                "Fee": "Transaction fees, processing fees",
+                "Food": "Restaurants, cafes, bars, food delivery apps, grocery store, or food mart",
+                "Gas": "Gas/fuel for an auto, gas station, fuel pump",
+                "Health": "Anything to do with health and medical",
+                "House": null,
+                "Investment": null,
+                "Investment › Fee": null,
+                "Investment › Interest": null,
+                "Investment › Transaction": null,
+                "Kids": "A transaction for one of my kids Asher faulk or Bristo Faulk",
+                "Legal": null,
+                "Service": null,
+                "Shopping": "The purchase of goods that are not food or alcohol",
+                "Subscriptions": "Subscription service such as streaming services, music service, online subscriptions",
+                "Travel": null,
+                "Utilities": "House hold bills, such as gas, water, and trash",
+                "other": null
+            })),
+        )
+        .unwrap();
+        (state, q)
+    }
+
+    fn food_option_text(tok: &Tok, seq: &Sequence) -> String {
+        let food = 6; // Alcohol, Auto, Bills, Donation, Entertainment, Fee, Food
+        tok.decode(&seq.ids[seq.markers[food]..seq.markers[food + 1]])
+            .unwrap()
+    }
+
+    #[test]
+    fn many_short_state_options_keep_descriptions_when_packed() {
+        let tok = tok();
+        let (state, q) = costco_question();
+        let python = build_sequence(&tok, &state, &q, 512, 192).unwrap();
+        let python_widths = option_widths(&python.markers);
+        let food_python = food_option_text(&tok, &python);
+        assert_eq!(
+            python_widths.iter().copied().max(),
+            Some(8),
+            "python packing should cap long options at 8 tokens, got {python_widths:?}"
+        );
+        assert!(
+            !food_python.to_lowercase().contains("grocery"),
+            "python packing should have chopped the Food description: {food_python}"
+        );
+
+        let head = packed_head_max_len(512, 192, tok.state_token_count(&state).unwrap());
+        let packed = build_sequence(&tok, &state, &q, 512, head).unwrap();
+        let packed_widths = option_widths(&packed.markers);
+        assert!(
+            packed_widths.iter().copied().max().unwrap() > 8,
+            "packed option widths {packed_widths:?}"
+        );
+        let food = food_option_text(&tok, &packed);
+        assert!(
+            food.to_lowercase().contains("grocery"),
+            "packed Food option should keep the grocery cue: {food}"
+        );
+        assert_eq!(packed.markers.len(), 22);
+    }
+
+    #[test]
+    fn nine_category_myphin_payload_is_unchanged_by_packing() {
+        let tok = tok();
+        let state = json!({
+            "transactionTitle": "AMEX EPAYMENT ACH PMT",
+            "direction": "money out"
+        });
+        let q = Question::from_def(
+            QType::Choice,
+            &json!("Which spending category does this bank transaction belong to? Pick other if none fits."),
+            Some(&json!({
+                "Dining": "Restaurants, cafes, bars",
+                "Groceries": "Supermarkets and food stores",
+                "Gas": null,
+                "Gas (2)": null,
+                "Utilities › Electric": "Power company bills",
+                "Café & Bakery": "Coffee shops, pâtisseries",
+                "Credit Card Payment": "Payments to a card issuer",
+                "Transfers": "Moves between own accounts",
+                "other": null
+            })),
+        )
+        .unwrap();
+        let python = build_sequence(&tok, &state, &q, 512, 192).unwrap();
+        let head = packed_head_max_len(512, 192, tok.state_token_count(&state).unwrap());
+        let packed = build_sequence(&tok, &state, &q, 512, head).unwrap();
+        assert_eq!(python, packed);
     }
 }

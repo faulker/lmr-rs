@@ -7,7 +7,9 @@
 
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{embedding, layer_norm, linear, ops::softmax, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{
+    embedding, layer_norm, linear, ops::softmax, Embedding, LayerNorm, Linear, VarBuilder,
+};
 use candle_transformers::models::modernbert::{self, ModernBert};
 
 use crate::config::LayaConfig;
@@ -59,7 +61,12 @@ impl HeadLayer {
         let att = softmax(&att, D::Minus1)?;
         let ctx = att.matmul(&v)?.transpose(1, 2)?.reshape((b, l, d))?;
         let x = (x + ctx.apply(&self.out_proj)?)?;
-        let ff = self.norm2.forward(&x)?.apply(&self.linear1)?.relu()?.apply(&self.linear2)?;
+        let ff = self
+            .norm2
+            .forward(&x)?
+            .apply(&self.linear1)?
+            .relu()?
+            .apply(&self.linear2)?;
         Ok((x + ff)?)
     }
 }
@@ -96,7 +103,11 @@ impl DecisionModel {
         let n_heads = (d / 64).max(1);
         let mut head = Vec::with_capacity(cfg.head_layers);
         for i in 0..cfg.head_layers {
-            head.push(HeadLayer::load(vb.pp(format!("head.layers.{i}")), d, n_heads)?);
+            head.push(HeadLayer::load(
+                vb.pp(format!("head.layers.{i}")),
+                d,
+                n_heads,
+            )?);
         }
         Ok(Self {
             encoder,
@@ -152,7 +163,10 @@ impl DecisionModel {
         let top1 = sorted[0];
         let top2 = if sorted.len() > 1 { sorted[1] } else { 0.0 };
         let ent_v: f32 = ent.to_vec1::<f32>()?[0];
-        let feats = Tensor::new(&[[top1, top1 - top2, ent_v, (kf / 255.0) as f32]], &self.device)?;
+        let feats = Tensor::new(
+            &[[top1, top1 - top2, ent_v, (kf / 255.0) as f32]],
+            &self.device,
+        )?;
         let pooled = h.i((.., 0, ..))?; // [1, d]
         let act = Tensor::cat(&[pooled, feats], 1)?
             .apply(&self.act_l1)?

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>laya-rs</string>
+    <string>lmr-rs</string>
     <key>ProgramArguments</key>
     <array>
         <string>{{BIN}}</string>

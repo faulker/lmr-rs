@@ -165,11 +165,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          BIN="target/${{ matrix.target }}/release/laya-rs"
+          BIN="target/${{ matrix.target }}/release/lmr-rs"
           REPORTED="$("$BIN" --version)"
           echo "Binary reports: ${REPORTED}"
-          if [ "$REPORTED" != "laya-rs ${VERSION}" ]; then
-            echo "Binary version mismatch: expected 'laya-rs ${VERSION}', got '${REPORTED}'"
+          if [ "$REPORTED" != "lmr-rs ${VERSION}" ]; then
+            echo "Binary version mismatch: expected 'lmr-rs ${VERSION}', got '${REPORTED}'"
             exit 1
           fi
 
@@ -214,7 +214,7 @@ jobs:
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/laya-rs"
+          BIN="target/${{ matrix.target }}/release/lmr-rs"
           # Hardened runtime and a secure timestamp are both required for the
           # signature to be accepted by notarization.
           codesign --force \
@@ -236,9 +236,9 @@ jobs:
           set -euo pipefail
           KEY="$RUNNER_TEMP/notary.p8"
           printf '%s' "$APPLE_NOTARY_KEY" | base64 --decode > "$KEY"
-          ZIP="$RUNNER_TEMP/laya-rs-notarize.zip"
+          ZIP="$RUNNER_TEMP/lmr-rs-notarize.zip"
           # No --keepParent: the source is a single executable, not a bundle.
-          ditto -c -k "target/${{ matrix.target }}/release/laya-rs" "$ZIP"
+          ditto -c -k "target/${{ matrix.target }}/release/lmr-rs" "$ZIP"
           xcrun notarytool submit "$ZIP" \
             --key "$KEY" \
             --key-id "$APPLE_NOTARY_KEY_ID" \
@@ -251,7 +251,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           if [ -n "${APPLE_CERTIFICATE_P12:-}" ]; then
-            codesign --display --verbose=2 "target/${{ matrix.target }}/release/laya-rs" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            codesign --display --verbose=2 "target/${{ matrix.target }}/release/lmr-rs" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "APPLE_CERTIFICATE_P12 is not set: ${{ matrix.target }} is unsigned." \
               | tee -a "$GITHUB_STEP_SUMMARY"
@@ -260,14 +260,14 @@ jobs:
       - name: Package binary
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf "laya-rs-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" laya-rs
-          mv "laya-rs-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE/"
+          tar -czf "lmr-rs-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" lmr-rs
+          mv "lmr-rs-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: laya-rs-${{ matrix.target }}
-          path: laya-rs-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+          name: lmr-rs-${{ matrix.target }}
+          path: lmr-rs-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
 
       # Runs even when an earlier step failed, so a signing key never outlives
       # the job that used it.

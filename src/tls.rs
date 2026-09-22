@@ -51,7 +51,13 @@ pub fn prepare(cfg: &TlsSettings, config_dir: &Path, bind: IpAddr) -> Result<Tls
 pub async fn load(material: &TlsMaterial) -> Result<RustlsConfig> {
     RustlsConfig::from_pem_file(&material.cert, &material.key)
         .await
-        .with_context(|| format!("loading TLS files {} / {}", material.cert.display(), material.key.display()))
+        .with_context(|| {
+            format!(
+                "loading TLS files {} / {}",
+                material.cert.display(),
+                material.key.display()
+            )
+        })
 }
 
 /// Write a fresh self-signed certificate valid for `localhost` and `bind`; the key is 0600.
@@ -60,11 +66,13 @@ fn generate(cert_path: &Path, key_path: &Path, bind: IpAddr) -> Result<()> {
     if bind.is_unspecified() {
         names.push("127.0.0.1".into());
     }
-    let ck = rcgen::generate_simple_self_signed(names).context("generating self-signed certificate")?;
+    let ck =
+        rcgen::generate_simple_self_signed(names).context("generating self-signed certificate")?;
     if let Some(dir) = cert_path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    fs::write(cert_path, ck.cert.pem()).with_context(|| format!("writing {}", cert_path.display()))?;
+    fs::write(cert_path, ck.cert.pem())
+        .with_context(|| format!("writing {}", cert_path.display()))?;
     fs::write(key_path, ck.signing_key.serialize_pem())
         .with_context(|| format!("writing {}", key_path.display()))?;
     #[cfg(unix)]
@@ -79,10 +87,16 @@ fn generate(cert_path: &Path, key_path: &Path, bind: IpAddr) -> Result<()> {
 /// `AA:BB:..` SHA-256 of the first certificate in the PEM file, as browsers and `openssl`
 /// print it.
 fn fingerprint(cert_path: &Path) -> Result<String> {
-    let pem = fs::read_to_string(cert_path).with_context(|| format!("reading {}", cert_path.display()))?;
-    let der = first_der_block(&pem).ok_or_else(|| anyhow!("no CERTIFICATE block in {}", cert_path.display()))?;
+    let pem = fs::read_to_string(cert_path)
+        .with_context(|| format!("reading {}", cert_path.display()))?;
+    let der = first_der_block(&pem)
+        .ok_or_else(|| anyhow!("no CERTIFICATE block in {}", cert_path.display()))?;
     let digest = Sha256::digest(der);
-    Ok(digest.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":"))
+    Ok(digest
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":"))
 }
 
 /// Decode the base64 body between the first BEGIN/END CERTIFICATE lines.
@@ -133,9 +147,12 @@ mod tests {
 
     #[test]
     fn generates_once_then_reuses() {
-        let dir = std::env::temp_dir().join(format!("laya-rs-tls-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lmr-rs-tls-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let cfg = TlsSettings { enabled: true, ..Default::default() };
+        let cfg = TlsSettings {
+            enabled: true,
+            ..Default::default()
+        };
         let first = prepare(&cfg, &dir, "0.0.0.0".parse().unwrap()).unwrap();
         assert!(first.generated);
         assert_eq!(first.fingerprint.len(), 32 * 3 - 1);
@@ -147,7 +164,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&second.key).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&second.key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         fs::remove_dir_all(&dir).unwrap();
     }
