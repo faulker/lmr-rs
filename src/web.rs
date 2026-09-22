@@ -188,15 +188,21 @@ mod tests {
     }
 
     #[test]
-    fn example_chips_are_spam_and_urgency() {
+    fn example_chips_are_spam_urgency_and_a_hidden_rerank() {
         assert!(INDEX_HTML.contains(r#"data-example="spam""#));
         assert!(INDEX_HTML.contains(r#"data-example="urgency""#));
+        assert!(INDEX_HTML.contains(r#"data-example="rerank" hidden>Support<"#));
+        assert!(!INDEX_HTML.contains("Descale"));
+        assert!(APP_JS.contains(r#"query: "I forgot my password and can't log in""#));
+        assert!(!APP_JS.contains("espresso"));
         assert!(!INDEX_HTML.contains(r#"id="chips-gguf""#));
         assert!(!INDEX_HTML.contains(r#"data-example="hello""#));
         assert!(!INDEX_HTML.contains(r#"data-example="think""#));
         assert!(!INDEX_HTML.contains(r#"data-example="category""#));
-        assert!(APP_JS.contains(r#"loadExample("spam")"#));
+        assert!(APP_JS.contains(r#"loadExample(mode === "rerank" ? "rerank" : "spam")"#));
         assert!(APP_JS.contains("/web/systemone"));
+        assert!(APP_JS.contains("/web/rerank"));
+        assert!(APP_JS.contains(r#"info.body.engine === "rerank""#));
         assert!(!APP_JS.contains("/web/chat/completions"));
         assert!(APP_CSS.contains("[hidden]"));
         assert!(!APP_JS.contains(r#"loadExample("category")"#));

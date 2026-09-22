@@ -8,8 +8,11 @@
 //! - `model`: the ModernBERT encoder plus Laya's decision head, loaded from safetensors.
 //! - `gguf`: Qwen3 and MiniCPM5 GGUF, loaded through candle's quantized backends. Chat is extra;
 //!   System One is the portable request and response.
+//! - `rerank`: cross-encoder rerankers (bge-reranker-v2-m3) that score documents against a
+//!   query for `POST /v1/rerank`.
 //! - `decide`: `Agent`, which runs one System One request end to end and shapes the JSON answer.
-//! - `server`: the HTTP(S) API (`POST /v1/systemone`, `POST /v1/chat/completions`, `GET /health`)
+//! - `server`: the HTTP(S) API (`POST /v1/systemone`, `POST /v1/chat/completions`,
+//!   `POST /v1/rerank`, `GET /health`)
 //!   and the browser UI at `/`.
 //! - `web`: static files and the password cookie for that UI.
 //!
@@ -20,6 +23,7 @@ pub mod decide;
 pub mod gguf;
 pub mod hub;
 pub mod model;
+pub mod rerank;
 pub mod sequence;
 pub mod server;
 pub mod settings;
@@ -27,9 +31,12 @@ pub mod tls;
 pub mod tournament;
 pub mod web;
 
-pub use decide::{Agent, ChatMessage, ChatOpts, DecidePolicy, Decider, LmrError};
+pub use decide::{
+    Agent, ChatMessage, ChatOpts, DecidePolicy, Decider, LmrError, Ranked, RerankEngine, Reranked,
+};
 pub use gguf::GgufEngine;
-pub use hub::{CheckpointFiles, ModelFiles};
+pub use hub::{CheckpointFiles, ModelFiles, RerankFiles};
+pub use rerank::Reranker;
 pub use server::{Auth, HttpServer};
 pub use settings::Settings;
 pub use web::WebConfig;

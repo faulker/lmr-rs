@@ -66,6 +66,27 @@ pub trait ChatEngine: Send + Sync {
     fn chat(&mut self, messages: &[ChatMessage], opts: &ChatOpts) -> Result<Value, LmrError>;
 }
 
+/// One document's place in a rerank answer. `index` is its position in the request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ranked {
+    pub index: usize,
+    /// Sigmoid of the cross-encoder logit, in `[0, 1]`.
+    pub relevance_score: f64,
+}
+
+/// Cross-encoder reranking (`POST /v1/rerank`). Only reranker checkpoints implement this.
+pub trait RerankEngine: Send + Sync {
+    /// Score every document against `query`, best first. `tokens` is the summed input length.
+    fn rerank(&mut self, query: &str, documents: &[String]) -> Result<Reranked, LmrError>;
+}
+
+/// Sorted results plus the token count spent producing them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reranked {
+    pub results: Vec<Ranked>,
+    pub tokens: usize,
+}
+
 /// Anything the server can ask questions of. `Agent` is the real one; tests use a stub.
 /// Every engine accepts and returns the same System One document, so a client can
 /// switch checkpoints without changing request or response parsing.
@@ -86,8 +107,12 @@ pub trait Decider: Send + Sync {
             .unwrap_or("lmr-rs")
             .to_string()
     }
-    /// GGUF models return `Some`; Laya returns `None`.
+    /// GGUF models return `Some`; Laya and rerankers return `None`.
     fn as_chat(&mut self) -> Option<&mut dyn ChatEngine> {
+        None
+    }
+    /// Rerankers return `Some`; Laya and GGUF return `None`.
+    fn as_rerank(&mut self) -> Option<&mut dyn RerankEngine> {
         None
     }
 }

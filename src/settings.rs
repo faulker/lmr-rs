@@ -23,6 +23,28 @@ pub enum Engine {
     Laya,
     /// Causal GGUF chat model (candle quantized Qwen3 or Llama).
     Gguf,
+    /// Cross-encoder reranker (XLM-RoBERTa sequence classification, e.g. bge-reranker-v2-m3).
+    Rerank,
+}
+
+impl Engine {
+    /// Value of `model.engine` for this runtime.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Laya => "laya",
+            Self::Gguf => "gguf",
+            Self::Rerank => "rerank",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "laya" => Some(Self::Laya),
+            "gguf" => Some(Self::Gguf),
+            "rerank" => Some(Self::Rerank),
+            _ => None,
+        }
+    }
 }
 
 /// One named checkpoint this binary can download and run.
@@ -45,6 +67,9 @@ impl Variant {
     pub fn resolve(&self) -> ResolvedModel {
         match self.engine {
             Engine::Gguf => gguf_from_variant(self, ""),
+            Engine::Rerank => ResolvedModel::Rerank {
+                repo: self.repo.to_string(),
+            },
             Engine::Laya => ResolvedModel::Laya {
                 repo: self.repo.to_string(),
                 subfolder: self.subfolder.map(str::to_string),
@@ -100,6 +125,15 @@ pub const VARIANTS: &[Variant] = &[
         tokenizer_repo: None,
         description: "Tuned for typed decision questions (~846 MB)",
     },
+    Variant {
+        name: "bge-reranker-v2-m3",
+        engine: Engine::Rerank,
+        repo: "BAAI/bge-reranker-v2-m3",
+        subfolder: None,
+        filename: None,
+        tokenizer_repo: None,
+        description: "Multilingual cross-encoder reranker, POST /v1/rerank (~2.3 GB)",
+    },
 ];
 
 /// What `hub` should fetch after config and flags are applied.
@@ -114,6 +148,8 @@ pub enum ResolvedModel {
         filename: String,
         tokenizer_repo: String,
     },
+    /// A sequence-classification reranker: `config.json`, `tokenizer.json`, `model.safetensors`.
+    Rerank { repo: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -173,6 +209,9 @@ pub struct ModelSettings {
     pub subfolder: String,
     /// GGUF filename inside `repo`. Empty uses the variant default.
     pub filename: String,
+    /// `laya`, `gguf`, or `rerank` for a raw `repo`. Empty infers: the variant's engine,
+    /// `gguf` when `filename` is set, else `laya`.
+    pub engine: String,
     pub device: String,
     /// Spend unused `max_len` tokens on option texts when the state is short.
     pub pack_head: bool,
@@ -192,6 +231,7 @@ impl Default for ModelSettings {
             repo: String::new(),
             subfolder: String::new(),
             filename: String::new(),
+            engine: String::new(),
             device: "auto".into(),
             pack_head: true,
             tournament: true,
@@ -256,9 +296,11 @@ key = ""                # self-signed pair is generated next to this file on fir
 [model]
 # variant = "minicpm5-2b"   # omit to use a downloaded checkpoint; prompt if several are cached
                             # minicpm5-2b | qwen3-0.6b | english | multilingual | typed-decisions
+                            # | bge-reranker-v2-m3
 # repo = "convaiinnovations/laya"   # raw HF id or local dir; overrides variant
 # subfolder = ""
 # filename = ""         # GGUF file; overrides the variant default (e.g. MiniCPM5-2B-Q8_0.gguf)
+# engine = ""           # laya | gguf | rerank for a raw repo; empty infers from the files above
 device = "auto"         # auto | cpu | metal | cuda
 pack_head = true        # spend unused max_len tokens on option texts
 tournament = true       # split choice questions larger than tournament_after
@@ -347,6 +389,32 @@ impl Settings {
         if !self.model.repo.is_empty() && !self.model.variant.is_empty() {
             bail!("set model.repo or model.variant, not both");
         }
+        if !self.model.engine.is_empty() && Engine::parse(&self.model.engine).is_none() {
+            bail!(
+                "unknown model.engine {:?}; expected laya, gguf, or rerank",
+                self.model.engine
+            );
+        }
+        if let (Some(v), Some(e)) = (
+            variant(&self.model.variant),
+            Engine::parse(&self.model.engine),
+        ) {
+            if self.model.repo.is_empty() && v.engine != e {
+                bail!(
+                    "model.variant {:?} is a {} checkpoint, not {}",
+                    v.name,
+                    v.engine.name(),
+                    e.name()
+                );
+            }
+        }
+        if self.model.engine == "gguf"
+            && self.model.filename.is_empty()
+            && !self.model.repo.is_empty()
+            && gguf_variant_for_repo(&self.model.repo).is_none()
+        {
+            bail!("model.engine = \"gguf\" needs model.filename");
+        }
         if !self.model.filename.is_empty() && !self.uses_gguf() {
             bail!("model.filename is only used for GGUF models (qwen3-0.6b, minicpm5-2b, or repo + filename)");
         }
@@ -385,21 +453,51 @@ impl Settings {
         !self.model.repo.is_empty() || !self.model.variant.is_empty()
     }
 
-    /// True when this config loads a GGUF chat model rather than Laya.
+    /// True when this config loads a GGUF chat model rather than Laya or a reranker.
     pub fn uses_gguf(&self) -> bool {
-        if !self.model.repo.is_empty() {
-            return !self.model.filename.is_empty()
-                || gguf_variant_for_repo(&self.model.repo).is_some();
+        self.engine() == Engine::Gguf
+    }
+
+    /// Which runtime the configured checkpoint uses: `model.engine` when set, else the
+    /// variant's engine, else `gguf` when a filename (or a known GGUF repo) is named, else Laya.
+    pub fn engine(&self) -> Engine {
+        if let Some(e) = Engine::parse(&self.model.engine) {
+            if self.model.repo.is_empty() {
+                if let Some(v) = variant(&self.model.variant) {
+                    return v.engine;
+                }
+            }
+            return e;
         }
-        variant(&self.model.variant).is_some_and(|v| v.engine == Engine::Gguf)
+        if !self.model.repo.is_empty() {
+            if !self.model.filename.is_empty() || gguf_variant_for_repo(&self.model.repo).is_some()
+            {
+                return Engine::Gguf;
+            }
+            if rerank_variant_for_repo(&self.model.repo).is_some() {
+                return Engine::Rerank;
+            }
+            return Engine::Laya;
+        }
+        variant(&self.model.variant).map_or(Engine::Laya, |v| v.engine)
     }
 
     /// What `hub` should download (or open on disk).
     pub fn resolve_model(&self) -> ResolvedModel {
         let m = &self.model;
         if !m.repo.is_empty() {
-            if let Some(spec) = resolve_gguf(&m.repo, &m.filename) {
-                return spec;
+            match self.engine() {
+                Engine::Gguf => {
+                    if let Some(spec) = resolve_gguf(&m.repo, &m.filename) {
+                        return spec;
+                    }
+                }
+                Engine::Rerank => {
+                    return ResolvedModel::Rerank {
+                        repo: m.repo.clone(),
+                    }
+                }
+                Engine::Laya => {}
             }
             let sub = (!m.subfolder.is_empty()).then(|| m.subfolder.clone());
             return ResolvedModel::Laya {
@@ -409,6 +507,9 @@ impl Settings {
         }
         match variant(&m.variant) {
             Some(v) if v.engine == Engine::Gguf => gguf_from_variant(v, &m.filename),
+            Some(v) if v.engine == Engine::Rerank => ResolvedModel::Rerank {
+                repo: v.repo.to_string(),
+            },
             Some(v) => ResolvedModel::Laya {
                 repo: v.repo.to_string(),
                 subfolder: v.subfolder.map(str::to_string),
@@ -449,6 +550,13 @@ fn gguf_variant_for_repo(repo: &str) -> Option<&'static Variant> {
     VARIANTS
         .iter()
         .find(|v| v.engine == Engine::Gguf && v.repo == repo)
+}
+
+/// Look a reranker catalog entry up by its repo id.
+fn rerank_variant_for_repo(repo: &str) -> Option<&'static Variant> {
+    VARIANTS
+        .iter()
+        .find(|v| v.engine == Engine::Rerank && v.repo == repo)
 }
 
 /// Build a GGUF spec from a catalog entry, honoring an optional filename override.
@@ -635,6 +743,55 @@ mod tests {
                 tokenizer_repo: "/tmp/weights".into(),
             }
         );
+    }
+
+    #[test]
+    fn rerank_variant_and_engine_key_resolve() {
+        let s = Settings::parse("[model]\nvariant = \"bge-reranker-v2-m3\"\n").unwrap();
+        assert!(s.validate().is_ok());
+        assert!(!s.uses_gguf());
+        assert_eq!(s.engine(), Engine::Rerank);
+        assert_eq!(
+            s.resolve_model(),
+            ResolvedModel::Rerank {
+                repo: "BAAI/bge-reranker-v2-m3".into(),
+            }
+        );
+        assert_eq!(
+            variant("bge-reranker-v2-m3").unwrap().resolve(),
+            s.resolve_model()
+        );
+        // The catalog repo is recognised without an engine key.
+        let s = Settings::parse("[model]\nrepo = \"BAAI/bge-reranker-v2-m3\"\n").unwrap();
+        assert_eq!(s.engine(), Engine::Rerank);
+        // Any other repo needs model.engine = "rerank".
+        let s = Settings::parse("[model]\nrepo = \"BAAI/bge-reranker-base\"\n").unwrap();
+        assert_eq!(s.engine(), Engine::Laya);
+        let s =
+            Settings::parse("[model]\nrepo = \"BAAI/bge-reranker-base\"\nengine = \"rerank\"\n")
+                .unwrap();
+        assert!(s.validate().is_ok());
+        assert_eq!(
+            s.resolve_model(),
+            ResolvedModel::Rerank {
+                repo: "BAAI/bge-reranker-base".into(),
+            }
+        );
+        let s = Settings::parse("[model]\nengine = \"tensorflow\"\n").unwrap();
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown model.engine"));
+        let s = Settings::parse("[model]\nvariant = \"english\"\nengine = \"rerank\"\n").unwrap();
+        assert!(s.validate().unwrap_err().to_string().contains("is a laya"));
+        let s = Settings::parse("[model]\nrepo = \"a/b\"\nengine = \"gguf\"\n").unwrap();
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs model.filename"));
+        assert!(TEMPLATE.contains("bge-reranker-v2-m3"));
     }
 
     #[test]

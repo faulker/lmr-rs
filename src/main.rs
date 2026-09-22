@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use lmr_rs::settings::{self, ResolvedModel, Settings, Variant, VARIANTS};
 use lmr_rs::{
     hub, tls, Agent, Auth, ChatMessage, ChatOpts, Decider, GgufEngine, HttpServer, ModelFiles,
-    WebConfig,
+    Reranker, WebConfig,
 };
 use serde_json::Value;
 
@@ -39,12 +39,16 @@ struct ModelArgs {
     /// Checkpoint subfolder inside the repo, e.g. `multilingual` or `typed-decisions`.
     #[arg(long)]
     subfolder: Option<String>,
-    /// Named checkpoint: minicpm5-2b, qwen3-0.6b, english, multilingual, typed-decisions.
+    /// Named checkpoint: minicpm5-2b, qwen3-0.6b, english, multilingual, typed-decisions,
+    /// bge-reranker-v2-m3.
     #[arg(long, conflicts_with = "model")]
     variant: Option<String>,
     /// GGUF filename inside the repo; overrides the variant default.
     #[arg(long)]
     filename: Option<String>,
+    /// Runtime for a raw --model: laya, gguf, or rerank (inferred when omitted).
+    #[arg(long)]
+    engine: Option<String>,
     /// Where to run: auto, cpu, metal, or cuda.
     #[arg(long)]
     device: Option<String>,
@@ -113,6 +117,15 @@ enum Command {
         /// `max_tokens` for `--prompt` (default 256).
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// Ranking criteria for a reranker (the `query` of POST /v1/rerank).
+        #[arg(long, alias = "criteria", conflicts_with_all = ["state", "question", "prompt"])]
+        query: Option<String>,
+        /// One document to rank; repeat for each item of the array.
+        #[arg(long, requires = "query")]
+        document: Vec<String>,
+        /// Keep only the best N documents.
+        #[arg(long, requires = "query")]
+        top_n: Option<usize>,
     },
     /// List cached checkpoints, or download / delete / update one.
     Models {
@@ -140,12 +153,16 @@ struct CacheModelArgs {
     /// Checkpoint subfolder inside the repo, e.g. `multilingual`.
     #[arg(long)]
     subfolder: Option<String>,
-    /// Named checkpoint: minicpm5-2b, qwen3-0.6b, english, multilingual, typed-decisions.
+    /// Named checkpoint: minicpm5-2b, qwen3-0.6b, english, multilingual, typed-decisions,
+    /// bge-reranker-v2-m3.
     #[arg(long, conflicts_with = "model")]
     variant: Option<String>,
     /// GGUF filename inside the repo; overrides the variant default.
     #[arg(long)]
     filename: Option<String>,
+    /// Runtime for a raw --model: laya, gguf, or rerank (inferred when omitted).
+    #[arg(long)]
+    engine: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -226,6 +243,7 @@ fn load_settings(config: &Option<PathBuf>, model: &ModelArgs) -> Result<(PathBuf
         model.variant.as_deref(),
         model.subfolder.as_deref(),
         model.filename.as_deref(),
+        model.engine.as_deref(),
         model.device.as_deref(),
     );
     Ok((path, s))
@@ -331,16 +349,13 @@ fn collect_choices(kind: PromptKind) -> Result<Vec<Choice>> {
 }
 
 fn choice_label(v: &Variant, st: &hub::CacheStatus) -> String {
-    let engine = match v.engine {
-        settings::Engine::Laya => "laya",
-        settings::Engine::Gguf => "gguf",
-    };
+    let engine = v.engine.name();
     let cached = if st.downloaded {
         format_bytes(st.bytes)
     } else {
         "-".into()
     };
-    format!("{:<16} {engine:<5} {cached:<8} {}", v.name, v.description)
+    format!("{:<18} {engine:<6} {cached:<8} {}", v.name, v.description)
 }
 
 /// Arrow-key picker. Scripts without a TTY still need an explicit catalog name.
@@ -392,6 +407,7 @@ fn load_cache_settings(
         variant.as_deref(),
         model.subfolder.as_deref(),
         model.filename.as_deref(),
+        model.engine.as_deref(),
         None,
     );
     Ok((path, s))
@@ -405,6 +421,7 @@ fn overlay_model(
     variant: Option<&str>,
     subfolder: Option<&str>,
     filename: Option<&str>,
+    engine: Option<&str>,
     device: Option<&str>,
 ) {
     if let Some(repo) = repo {
@@ -420,6 +437,9 @@ fn overlay_model(
     }
     if let Some(f) = filename {
         s.model.filename = f.to_string();
+    }
+    if let Some(e) = engine {
+        s.model.engine = e.to_string();
     }
     if let Some(d) = device {
         s.model.device = d.to_string();
@@ -472,6 +492,7 @@ fn load_runtime(files: &hub::ModelFiles, s: &Settings) -> Result<Box<dyn Decider
             Box::new(Agent::load_with_policy(files, &device, s.model.policy())?)
         }
         ModelFiles::Gguf(files) => Box::new(GgufEngine::load(files, &device)?),
+        ModelFiles::Rerank(files) => Box::new(Reranker::load(files, &device)?),
     };
     let device_name = runtime
         .info()
@@ -591,7 +612,7 @@ fn serve(
     let web = WebConfig::new(s.web.enabled, Some(s.web.password.clone()), s.tls.enabled);
     let server = HttpServer::from_listener(listener, runtime, auth, tls_material, web);
     eprintln!(
-        "listening on {scheme}://{bound}  (POST /v1/systemone, POST /v1/chat/completions, GET /v1/models, GET /health)"
+        "listening on {scheme}://{bound}  (POST /v1/systemone, POST /v1/chat/completions, POST /v1/rerank, GET /v1/models, GET /health)"
     );
     if s.web.enabled {
         eprintln!("web ui: {scheme}://{bound}/");
@@ -724,7 +745,30 @@ fn spec_label(spec: &ResolvedModel) -> String {
             filename,
             tokenizer_repo,
         } => format!("{repo}/{filename}  tokenizer {tokenizer_repo}"),
+        ResolvedModel::Rerank { repo } => format!("{repo}  (reranker)"),
     }
+}
+
+/// The `POST /v1/rerank` response for `ask --query`, documents included.
+fn rerank_document(ranked: lmr_rs::Reranked, documents: &[String], top_n: Option<usize>) -> Value {
+    let results: Vec<Value> = ranked
+        .results
+        .iter()
+        .take(top_n.unwrap_or(documents.len()).max(1))
+        .map(|r| {
+            serde_json::json!({
+                "index": r.index,
+                "relevance_score": r.relevance_score,
+                "document": documents[r.index],
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "model": "lmr-rs",
+        "object": "list",
+        "results": results,
+        "usage": { "prompt_tokens": ranked.tokens, "total_tokens": ranked.tokens },
+    })
 }
 
 /// Compact SI size for the cache column (`843 MB`, `1.5 GB`).
@@ -792,12 +836,23 @@ fn main() -> Result<()> {
             question,
             prompt,
             max_tokens,
+            query,
+            document,
+            top_n,
         } => {
             let (_, mut s) = load_settings(&cli.config, &model)?;
             apply_downloaded_model(&mut s)?;
             s.validate()?;
             let mut runtime = load_runtime(&fetch(&s)?, &s)?;
-            let answer = if let Some(prompt) = prompt {
+            let answer = if let Some(query) = query {
+                if document.is_empty() {
+                    bail!("--query needs at least one --document");
+                }
+                let engine = runtime.as_rerank().ok_or_else(|| {
+                    anyhow::anyhow!("this checkpoint is not a reranker; use --state and --question")
+                })?;
+                rerank_document(engine.rerank(&query, &document)?, &document, top_n)
+            } else if let Some(prompt) = prompt {
                 let chat = runtime.as_chat().ok_or_else(|| {
                     anyhow::anyhow!(
                         "this checkpoint is a System One model; use --state and --question"
@@ -956,11 +1011,73 @@ mod tests {
     #[test]
     fn overlay_model_flag_clears_a_configured_variant() {
         let mut s = Settings::parse("[model]\nvariant = \"multilingual\"\n").unwrap();
-        overlay_model(&mut s, Some("a/b"), None, None, None, None);
+        overlay_model(&mut s, Some("a/b"), None, None, None, None, None);
         assert_eq!(s.model.repo, "a/b");
         assert!(s.model.variant.is_empty());
         assert!(s.model_specified());
         assert!(s.validate().is_ok());
+        overlay_model(&mut s, None, None, None, None, Some("rerank"), None);
+        assert_eq!(s.model.engine, "rerank");
+        assert_eq!(
+            s.resolve_model(),
+            ResolvedModel::Rerank { repo: "a/b".into() }
+        );
+    }
+
+    #[test]
+    fn ask_query_takes_repeated_documents() {
+        let cli = parse(&[
+            "lmr-rs",
+            "ask",
+            "--criteria",
+            "coffee",
+            "--document",
+            "tea",
+            "--document",
+            "espresso",
+            "--top-n",
+            "1",
+        ]);
+        match cli.command {
+            Command::Ask {
+                query,
+                document,
+                top_n,
+                ..
+            } => {
+                assert_eq!(query.as_deref(), Some("coffee"));
+                assert_eq!(document, ["tea", "espresso"]);
+                assert_eq!(top_n, Some(1));
+            }
+            _ => panic!("expected ask"),
+        }
+        assert!(Cli::try_parse_from(["lmr-rs", "ask", "--query", "q", "--prompt", "p"]).is_err());
+        assert!(Cli::try_parse_from(["lmr-rs", "ask", "--document", "d"]).is_err());
+    }
+
+    #[test]
+    fn rerank_document_keeps_best_first_and_echoes_documents() {
+        let docs = vec!["tea".to_string(), "espresso".to_string()];
+        let ranked = lmr_rs::Reranked {
+            results: vec![
+                lmr_rs::Ranked {
+                    index: 1,
+                    relevance_score: 0.9,
+                },
+                lmr_rs::Ranked {
+                    index: 0,
+                    relevance_score: 0.1,
+                },
+            ],
+            tokens: 12,
+        };
+        let doc = rerank_document(ranked.clone(), &docs, None);
+        assert_eq!(doc["results"][0]["index"], 1);
+        assert_eq!(doc["results"][0]["document"], "espresso");
+        assert_eq!(doc["results"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["usage"]["prompt_tokens"], 12);
+        let top = rerank_document(ranked, &docs, Some(1));
+        assert_eq!(top["results"].as_array().unwrap().len(), 1);
     }
 
     fn names_for(kind: PromptKind, downloaded: &[&str]) -> Vec<&'static str> {
@@ -983,5 +1100,11 @@ mod tests {
         assert!(label.contains("english"));
         assert!(label.contains("laya"));
         assert!(label.contains("843 MB"));
+        let r = settings::variant("bge-reranker-v2-m3").unwrap();
+        assert!(choice_label(r, &st).contains("rerank"));
+        assert_eq!(
+            spec_label(&r.resolve()),
+            "BAAI/bge-reranker-v2-m3  (reranker)"
+        );
     }
 }

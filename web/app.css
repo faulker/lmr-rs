@@ -386,6 +386,10 @@ button:focus-visible {
   font-size: 0.82rem;
 }
 
+.ranked .bar-row {
+  grid-template-columns: minmax(8rem, 3fr) 2fr 3.2rem;
+}
+
 .bar-label {
   overflow: hidden;
   text-overflow: ellipsis;

@@ -17,6 +17,21 @@ const EXAMPLES = {
   },
 };
 
+EXAMPLES.rerank = {
+  query: "I forgot my password and can't log in",
+  documents: [
+    "Updating the billing address on your account",
+    "Resetting a forgotten password from the sign-in page",
+    "Turning on two-factor authentication",
+    "Changing your password from account settings",
+    "Fixing login errors after a password reset",
+  ],
+  top_n: 5,
+};
+
+/** `"rerank"` when the loaded checkpoint answers /web/rerank, else `"systemone"`. */
+let mode = "systemone";
+
 const $ = (id) => document.getElementById(id);
 
 /** Fetch JSON from a same-origin path, sending the session cookie. */
@@ -70,7 +85,15 @@ function showParseError() {
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
       throw new Error("document must be an object");
     }
-    if (!doc.questions || typeof doc.questions !== "object") {
+    if (mode === "rerank") {
+      const query = doc.query ?? doc.criteria;
+      if (typeof query !== "string" || !query.trim()) {
+        throw new Error("document needs a query string");
+      }
+      if (!Array.isArray(doc.documents) || !doc.documents.length) {
+        throw new Error("document needs a documents array");
+      }
+    } else if (!doc.questions || typeof doc.questions !== "object") {
       throw new Error("document needs questions");
     }
     el.textContent = "";
@@ -190,15 +213,57 @@ function renderAnswer(id, answer) {
   return article;
 }
 
-function showResult(doc) {
+/** The text shown for one ranked document: the string itself, its `text`, or compact JSON. */
+function documentLabel(doc) {
+  if (typeof doc === "string") return doc;
+  if (doc && typeof doc === "object" && typeof doc.text === "string") return doc.text;
+  return JSON.stringify(doc);
+}
+
+/** Ranked list: best first, one bar per document scaled by relevance. */
+function renderRanked(doc, request) {
+  const wrap = document.createElement("div");
+  const results = Array.isArray(doc.results) ? doc.results : [];
+  const sent = request && Array.isArray(request.documents) ? request.documents : [];
+  const best = results[0];
+  wrap.append(text("p", best ? documentLabel(best.document ?? sent[best.index]) : "—", "choice-win"));
+  const bars = document.createElement("div");
+  bars.className = "bars ranked";
+  results.forEach((r, i) => {
+    const p = Number(r.relevance_score) || 0;
+    const row = document.createElement("div");
+    row.className = "bar-row" + (i === 0 ? " is-win" : "");
+    row.append(text("span", `${r.index}. ${documentLabel(r.document ?? sent[r.index])}`, "bar-label"));
+    const track = document.createElement("span");
+    track.className = "bar-track";
+    const fill = document.createElement("span");
+    fill.className = "bar-fill";
+    fill.style.setProperty("--p", String(Math.max(0, Math.min(1, p))));
+    track.append(fill);
+    row.append(track);
+    row.append(text("span", pct(p), "bar-n"));
+    bars.append(row);
+  });
+  wrap.append(bars);
+  return wrap;
+}
+
+function showResult(doc, request) {
   const verdict = $("verdict");
   verdict.replaceChildren();
+  if (mode === "rerank") {
+    const article = document.createElement("article");
+    article.className = "answer";
+    article.append(text("p", "ranked", "qid"));
+    article.append(renderRanked(doc, request));
+    verdict.append(article);
+  }
   const answers = doc && doc.answers && typeof doc.answers === "object" ? doc.answers : {};
   for (const id of Object.keys(answers)) {
     verdict.append(renderAnswer(id, answers[id]));
   }
   if (doc && doc.usage) {
-    const inTok = doc.usage.input_tokens;
+    const inTok = doc.usage.input_tokens ?? doc.usage.prompt_tokens;
     if (inTok != null) {
       verdict.append(text("p", `${inTok} input tokens`, "usage"));
     }
@@ -233,12 +298,13 @@ async function decide() {
   $("toggle-json").hidden = true;
   $("submit").disabled = true;
   try {
-    const { ok, body } = await api("/web/systemone", { method: "POST", body: editorValue() });
+    const path = mode === "rerank" ? "/web/rerank" : "/web/systemone";
+    const { ok, body } = await api(path, { method: "POST", body: editorValue() });
     if (!ok) {
       showFail(failMessage(body));
       return;
     }
-    showResult(body);
+    showResult(body, JSON.parse(editorValue()));
   } catch (err) {
     showFail(err.message);
   } finally {
@@ -280,10 +346,28 @@ async function openApp(locked) {
   if (info.ok && info.body) {
     const parts = [info.body.checkpoint, info.body.device, info.body.encoder].filter(Boolean);
     $("meta").textContent = parts.join(" · ");
+    setMode(info.body.engine === "rerank" ? "rerank" : "systemone");
   }
-  if (!editorValue().trim()) loadExample("spam");
+  if (!editorValue().trim()) loadExample(mode === "rerank" ? "rerank" : "spam");
   else showParseError();
   $("editor").focus();
+}
+
+/** Swap the console between the System One document and the rerank request. */
+function setMode(next) {
+  if (next === mode) return;
+  mode = next;
+  const rerank = mode === "rerank";
+  $("submit").textContent = rerank ? "Rank" : "Decide";
+  $("result-heading").textContent = rerank ? "Ranking" : "Verdict";
+  // Static markup, not user input.
+  $("empty-copy").innerHTML = rerank
+    ? "A rerank request is a <code>query</code> (the criteria) plus a <code>documents</code> array. Paste one, or load the example."
+    : "A System One document is <code>state</code> plus <code>questions</code>. Paste one, or load an example.";
+  document.querySelectorAll(".chip").forEach((chip) => {
+    chip.hidden = (chip.dataset.example === "rerank") !== rerank;
+  });
+  $("editor").value = "";
 }
 
 function onKey(event) {

@@ -1,11 +1,13 @@
 # lmr-rs
 
 Native Rust inference for local models. It currently runs [Laya](https://github.com/NandhaKishorM/laya),
-the open-weights (Apache 2.0) System One decision model from Convai Innovations, and is named so
-it can grow beyond that one engine. It downloads the checkpoint from Hugging Face, runs it with
-[candle](https://github.com/huggingface/candle), and serves the same `POST /v1/systemone` API that
-typesafe.ai exposes. No Python. Loopback and keyless by default; a small TOML config turns it into
-a daemon with an API key and TLS that other machines can use.
+the open-weights (Apache 2.0) System One decision model from Convai Innovations, small GGUF chat
+models, and the [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) cross-encoder,
+and is named so it can grow beyond any one engine. It downloads the checkpoint from Hugging Face,
+runs it with [candle](https://github.com/huggingface/candle), and serves the same `POST /v1/systemone`
+API that typesafe.ai exposes (plus `POST /v1/rerank` for rerankers). No Python. Loopback and keyless
+by default; a small TOML config turns it into a daemon with an API key and TLS that other machines
+can use.
 
 Built for [myphin](../myphin)'s "Laya (local)" categorization provider, but any client that
 speaks the System One request shape can use it.
@@ -18,6 +20,7 @@ speaks the System One request shape can use it.
   model runs in F32). The multilingual checkpoint is smaller on disk (~678 MB: 644 MB weights
   plus a 34 MB tokenizer) but still needs over a gigabyte of RAM in F32. GGUF chat variants
   are smaller on disk: Qwen3 0.6B Q8_0 is about 640 MB, MiniCPM5 2B Q4_K_M is about 1.5 GB.
+  The bge-reranker-v2-m3 checkpoint is 2.3 GB on disk and about as much in RAM (F32).
 - macOS: build with `--features metal` for the GPU. Linux with an NVIDIA GPU: `--features cuda`.
   CPU works everywhere; a ModernBERT-large request takes roughly a second on an M-series CPU and
   ~40 ms on Metal.
@@ -52,12 +55,15 @@ cargo build --release                      # CPU only
   OpenAI-compatible chat API for GGUF models (`messages`, `temperature`, `top_p`, `top_k`,
   `max_tokens`, `seed`, `chat_template_kwargs`). Laya rejects it. `GET /v1/models` lists the
   loaded file. `GET /v1/health` is an alias of `/health`.
+- `POST /v1/rerank` orders an array by how well each item matches a criterion, on reranker
+  checkpoints (`bge-reranker-v2-m3`). See [Reranking](#reranking).
 - `GET /health` returns the loaded checkpoint and device (`status` is `"ok"` when ready).
 - `GET /` is a browser console (on by default). It always posts a System One document to
   `POST /web/systemone`, gated by `web.password` (or open if the password is empty), not by
   the API key. `web.enabled = false` or `--no-web` hides it.
 
-Each inference request (`/v1/systemone`, `/v1/chat/completions`, and the `/web/*` twins) prints
+Each inference request (`/v1/systemone`, `/v1/chat/completions`, `/v1/rerank`, and the `/web/*`
+twins) prints
 one stderr line with the UTC timestamp, client IP, `api` or `web`, and how long it took (for
 example `2026-09-21T03:17:42Z  127.0.0.1  api  41ms`). The question is not logged. When
 daemonized, that line goes to the log file with the rest of stderr.
@@ -71,6 +77,10 @@ Quick manual check without the server:
 
 # GGUF chat (same JSON the HTTP API returns)
 ./target/release/lmr-rs ask --variant qwen3-0.6b --prompt "Who are you?"
+
+# Rerank (same JSON as POST /v1/rerank); --criteria is an alias of --query
+./target/release/lmr-rs ask --variant bge-reranker-v2-m3 --query "what is panda?" \
+    --document "hi" --document "The giant panda is a bear species endemic to China."
 ```
 
 ## Configuration
@@ -104,9 +114,11 @@ key = ""                # self-signed pair is generated next to this file on fir
 [model]
 # variant = "minicpm5-2b"   # omit to use a downloaded checkpoint; prompt if several are cached
                             # minicpm5-2b | qwen3-0.6b | english | multilingual | typed-decisions
+                            # | bge-reranker-v2-m3
 # repo = "convaiinnovations/laya"   # raw HF id or local dir; overrides variant
 # subfolder = ""
 # filename = ""         # GGUF file; overrides the variant default
+# engine = ""           # laya | gguf | rerank for a raw repo; empty infers from the files above
 device = "auto"         # auto | cpu | metal | cuda
 pack_head = true        # spend unused max_len tokens on option texts
 tournament = true       # split choice questions larger than tournament_after
@@ -135,7 +147,7 @@ Flags on `serve` override the file for one run:
 | `--web` | `web.enabled` | Serve the browser UI at `/` (the default). |
 | `--no-web` | `web.enabled = false` | Hide that UI. |
 | `--web-password` | `web.password` | Gate that UI; omit (and leave the config empty) to leave it open. |
-| `--model`, `--subfolder`, `--variant`, `--device` | `[model]` | Which checkpoint and where to run it. |
+| `--model`, `--subfolder`, `--variant`, `--filename`, `--engine`, `--device` | `[model]` | Which checkpoint and where to run it. |
 | `--daemonize` | `[daemon]` | Fork into the background (Unix). |
 
 `HF_TOKEN` is honoured by the downloader if you need it; it is never printed.
@@ -171,13 +183,16 @@ is cached).
 | `english` | Laya | ModernBERT-large, English (~843 MB). |
 | `multilingual` | Laya | mmBERT-base, 100+ languages (~678 MB). |
 | `typed-decisions` | Laya | Tuned for typed decision questions (~846 MB). |
+| `bge-reranker-v2-m3` | Rerank | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) multilingual cross-encoder (~2.3 GB). Serves `POST /v1/rerank` only. |
 
 Set `model.variant` in the config, or pass `--variant minicpm5-2b` to `download`, `serve`, or
 `ask`. Leave it unset to use a downloaded checkpoint. `model.repo` (or `--model`) takes any
 Hugging Face id or a local checkpoint directory instead; `--subfolder` picks a folder inside
-a Laya repo, `--filename` picks a GGUF file (for example `MiniCPM5-2B-Q8_0.gguf`). Every
-variant serves `POST /v1/systemone` with the same request and response. GGUF models also
-serve the llama.cpp OpenAI chat API as an extra:
+a Laya repo, `--filename` picks a GGUF file (for example `MiniCPM5-2B-Q8_0.gguf`), and
+`--engine rerank` (or `model.engine`) marks a raw repo as a reranker (the catalog repo is
+recognised on its own). Laya and GGUF variants serve `POST /v1/systemone` with the same request
+and response; a reranker answers `POST /v1/rerank` instead and returns 422 on `/v1/systemone`.
+GGUF models also serve the llama.cpp OpenAI chat API as an extra:
 
 ```sh
 curl http://127.0.0.1:8321/v1/systemone \
@@ -191,6 +206,39 @@ or `/think` and `/no_think` in the user text:
 ```json
 {"messages":[{"role":"user","content":"Who are you?"}],"chat_template_kwargs":{"enable_thinking":false}}
 ```
+
+## Reranking
+
+With `bge-reranker-v2-m3` loaded, `POST /v1/rerank` scores every item of `documents` against
+`query` (the criterion) with one cross-encoder pass per pair and returns them best first. The
+request and response follow llama.cpp, Jina, and Cohere, so existing rerank clients work:
+
+```sh
+curl http://127.0.0.1:8321/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"query":"what is panda?","top_n":2,"return_documents":true,
+       "documents":["hi","The giant panda is a bear species endemic to China."]}'
+```
+
+```json
+{"model":"BAAI/bge-reranker-v2-m3","object":"list",
+ "results":[{"index":1,"relevance_score":0.9949,"document":"The giant panda is a bear species endemic to China."},
+            {"index":0,"relevance_score":0.0003,"document":"hi"}],
+ "usage":{"prompt_tokens":42,"total_tokens":42}}
+```
+
+- `query` (alias `criteria`) is the text every document is judged against. Phrase it like a
+  search query; the model rewards passages that actually answer it, and scores drop to ~0 when
+  a passage does not mention the subject at all.
+- `documents` is any JSON array. Strings are scored as they are; objects with a `text` field
+  are scored on that field; anything else is serialized to compact JSON, so `[{"id":7, ...}]`
+  works. `return_documents: true` echoes the original value back in each result.
+- `relevance_score` is the sigmoid of the cross-encoder logit (what FlagEmbedding's
+  `compute_score(normalize=True)` returns), `top_n` keeps the best N, and `index` is the
+  position in the request. Pairs longer than the tokenizer's `model_max_length` (8192 for this
+  checkpoint) are truncated.
+- The web console at `/` switches to a `query` + `documents` editor when a reranker is loaded,
+  and `lmr-rs ask --query ... --document ... --document ...` runs the same request offline.
 
 ## Exposing it beyond localhost
 
@@ -338,6 +386,8 @@ than bumping from a missing tag.
   small model's standing preference for one name (`Fee`, `other`) does not decide every
   transaction. Small models still lean on any "pick other if none fits" wording in
   `instructions`, so leave that out and let `other` be a plain option.
+- `src/rerank.rs` loads an XLM-RoBERTa sequence classifier (candle's `xlm_roberta`) and scores
+  `<s> query </s></s> document </s>` one pair at a time for `POST /v1/rerank`.
 - `src/decide.rs` applies the per bucket calibration temperature from the checkpoint config and
   the entropy based confidence, then shapes the JSON. That shape is shared by every engine.
 - `src/settings.rs` is the TOML config and the startup safety rules; `src/tls.rs` finds or

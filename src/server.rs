@@ -1,6 +1,7 @@
 //! HTTP(S) API. `POST /v1/systemone` takes `{"state": .., "questions": {..}}` and returns
 //! the same System One answer document for every engine; `POST /v1/chat/completions` is an
-//! extra OpenAI-shaped chat path for GGUF models; `GET /health` reports what is loaded.
+//! extra OpenAI-shaped chat path for GGUF models; `POST /v1/rerank` orders `documents` by
+//! relevance to `query` on reranker checkpoints; `GET /health` reports what is loaded.
 //! When the web UI is on, `/` serves a browser console that posts to `/web/systemone`
 //! (session cookie, never the API key). Each inference request prints a stderr line with
 //! the UTC time, client IP, whether it came from the API or the web UI, and how long it
@@ -28,6 +29,7 @@ use serde_json::{json, Map, Value};
 use subtle::ConstantTimeEq;
 
 use crate::decide::{ChatMessage, ChatOpts, Decider, LmrError};
+use crate::sequence::serialize_state;
 use crate::tls::{self, TlsMaterial};
 use crate::web::{self, WebConfig};
 
@@ -66,6 +68,32 @@ struct ChatCompletionRequest {
 struct ChatMessageIn {
     role: String,
     content: String,
+}
+
+/// llama.cpp / Jina / Cohere `POST /v1/rerank` body. `criteria` is accepted for `query`.
+/// Documents are strings, `{"text": ..}` objects, or any JSON value (serialized like a
+/// System One state). Extra fields are ignored.
+#[derive(Deserialize)]
+struct RerankRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(alias = "criteria")]
+    query: String,
+    documents: Vec<Value>,
+    top_n: Option<i64>,
+    #[serde(default)]
+    return_documents: bool,
+}
+
+/// The text a reranker scores for one request document.
+fn document_text(doc: &Value) -> String {
+    match doc {
+        Value::Object(o) => match o.get("text") {
+            Some(Value::String(s)) => s.clone(),
+            _ => serialize_state(doc),
+        },
+        other => serialize_state(other),
+    }
 }
 
 /// Who may call. With `key = None` every request is accepted.
@@ -126,7 +154,8 @@ impl HttpServer {
             .route("/v1/health", get(health))
             .route("/v1/models", get(models))
             .route("/v1/systemone", post(system_one))
-            .route("/v1/chat/completions", post(chat_completions));
+            .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/rerank", post(rerank));
         if enabled {
             app = app
                 .route("/", get(|| async { web::index() }))
@@ -137,7 +166,8 @@ impl HttpServer {
                 .route("/web/logout", post(web_logout))
                 .route("/web/info", get(web_info))
                 .route("/web/systemone", post(web_system_one))
-                .route("/web/chat/completions", post(web_chat_completions));
+                .route("/web/chat/completions", post(web_chat_completions))
+                .route("/web/rerank", post(web_rerank));
         }
         let app = app
             .fallback(|| async { reply(404, json!({ "message": "not found" })) })
@@ -346,6 +376,121 @@ async fn web_chat_completions(
     response
 }
 
+/// Same document as `POST /v1/rerank`, gated by the web session instead of the API key.
+async fn web_rerank(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let started = Instant::now();
+    let who = peer_who(peer);
+    let response = if !s.web.allows(&headers) {
+        web_unauthorized()
+    } else {
+        decide_rerank(s.decider.clone(), body).await
+    };
+    log_request(&who, "web", started);
+    response
+}
+
+async fn rerank(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let started = Instant::now();
+    let who = peer_who(peer);
+    let response = if !authorized(&s.auth, &headers) {
+        unauthorized()
+    } else {
+        decide_rerank(s.decider.clone(), body).await
+    };
+    log_request(&who, "api", started);
+    response
+}
+
+/// Parse a rerank body, score it on the blocking thread, and shape the Jina / llama.cpp
+/// response: `results` best first, each `{index, relevance_score[, document]}`.
+async fn decide_rerank(
+    decider: Arc<Mutex<Box<dyn Decider>>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match read_body(body) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: RerankRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return openai_error(
+                422,
+                "invalid_request_error",
+                &format!("invalid request: {e}"),
+            )
+        }
+    };
+    if req.documents.is_empty() {
+        return openai_error(422, "invalid_request_error", "documents must not be empty");
+    }
+    let top_n = match req.top_n {
+        None => req.documents.len(),
+        Some(n) if n >= 1 => n as usize,
+        Some(_) => return openai_error(422, "invalid_request_error", "top_n must be at least 1"),
+    };
+    let texts: Vec<String> = req.documents.iter().map(document_text).collect();
+    let query = req.query.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut d = decider.lock().unwrap_or_else(|e| e.into_inner());
+        let id = d.openai_model_id();
+        match d.as_rerank() {
+            Some(engine) => engine.rerank(&query, &texts).map(|r| (id, r)),
+            None => Err(LmrError::Invalid(
+                "this checkpoint is not a reranker; use POST /v1/systemone".into(),
+            )),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok((id, ranked))) => {
+            let results: Vec<Value> = ranked
+                .results
+                .iter()
+                .take(top_n)
+                .map(|r| {
+                    let mut item = json!({
+                        "index": r.index,
+                        "relevance_score": r.relevance_score,
+                    });
+                    if req.return_documents {
+                        item["document"] = req.documents[r.index].clone();
+                    }
+                    item
+                })
+                .collect();
+            reply(
+                200,
+                json!({
+                    "model": req.model.unwrap_or(id),
+                    "object": "list",
+                    "results": results,
+                    "usage": { "prompt_tokens": ranked.tokens, "total_tokens": ranked.tokens },
+                }),
+            )
+        }
+        Ok(Err(LmrError::Invalid(m))) => openai_error(422, "invalid_request_error", &m),
+        Ok(Err(LmrError::Model(e))) => {
+            eprintln!("model error: {e:#}");
+            openai_error(500, "api_error", "model error")
+        }
+        Err(e) => {
+            eprintln!("inference task failed: {e}");
+            openai_error(500, "api_error", "model error")
+        }
+    }
+}
+
 /// llama.cpp / OpenAI error object used on the chat and models routes.
 fn openai_error(status: u16, kind: &str, message: &str) -> Response {
     reply(
@@ -522,7 +667,7 @@ async fn web_logout(State(s): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decide::ChatEngine;
+    use crate::decide::{ChatEngine, Ranked, RerankEngine, Reranked};
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -545,6 +690,28 @@ mod tests {
                 }],
                 "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
             }))
+        }
+    }
+
+    impl RerankEngine for Stub {
+        /// Longer documents score higher, so the order is predictable.
+        fn rerank(&mut self, query: &str, documents: &[String]) -> Result<Reranked, LmrError> {
+            if query.is_empty() {
+                return Err(LmrError::Invalid("query must not be empty".into()));
+            }
+            let mut results: Vec<Ranked> = documents
+                .iter()
+                .enumerate()
+                .map(|(index, d)| Ranked {
+                    index,
+                    relevance_score: d.len() as f64 / 100.0,
+                })
+                .collect();
+            results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+            Ok(Reranked {
+                results,
+                tokens: documents.len(),
+            })
         }
     }
 
@@ -575,6 +742,9 @@ mod tests {
             json!({ "status": "ok", "model": "stub", "engine": "laya", "checkpoint": "stub" })
         }
         fn as_chat(&mut self) -> Option<&mut dyn ChatEngine> {
+            Some(self)
+        }
+        fn as_rerank(&mut self) -> Option<&mut dyn RerankEngine> {
             Some(self)
         }
     }
@@ -715,6 +885,67 @@ mod tests {
         assert!(body["error"]["message"].as_str().unwrap().contains("empty"));
     }
 
+    const RERANK_REQ: &str = r#"{"query":"coffee","documents":["tea","espresso","a latte please"],"top_n":2,"return_documents":true}"#;
+
+    #[test]
+    fn rerank_orders_documents_and_honours_top_n() {
+        let addr = start(None);
+        let (status, body) = call(addr, "POST", "/v1/rerank", "", RERANK_REQ);
+        assert_eq!(status, 200);
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "stub");
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["index"], 2);
+        assert_eq!(results[0]["document"], "a latte please");
+        assert_eq!(results[1]["index"], 1);
+        assert!(
+            results[0]["relevance_score"].as_f64().unwrap()
+                > results[1]["relevance_score"].as_f64().unwrap()
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+        // `criteria` is an alias for `query`; objects use their `text`; no documents echoed.
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/v1/rerank",
+            "",
+            r#"{"criteria":"coffee","documents":[{"text":"x"},{"text":"longer text"},{"id":7}]}"#,
+        );
+        assert_eq!(status, 200);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["index"], 1);
+        assert!(results[0].get("document").is_none());
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/v1/rerank",
+            "",
+            r#"{"query":"q","documents":[]}"#,
+        );
+        assert_eq!(status, 422);
+        assert!(body["error"]["message"].as_str().unwrap().contains("empty"));
+        let (status, _) = call(
+            addr,
+            "POST",
+            "/v1/rerank",
+            "",
+            r#"{"query":"q","documents":["a"],"top_n":0}"#,
+        );
+        assert_eq!(status, 422);
+        let (status, _) = call(addr, "POST", "/v1/rerank", "", r#"{"documents":["a"]}"#);
+        assert_eq!(status, 422);
+    }
+
+    #[test]
+    fn document_text_reads_strings_text_fields_and_json() {
+        assert_eq!(document_text(&json!("plain")), "plain");
+        assert_eq!(document_text(&json!({"text": "t", "id": 1})), "t");
+        assert_eq!(document_text(&json!({"id": 1})), "{\"id\": 1}");
+        assert_eq!(document_text(&json!(["a", 1])), "[\"a\", 1]");
+    }
+
     #[test]
     fn rejects_bad_input_and_unknown_paths() {
         let addr = start(None);
@@ -771,6 +1002,18 @@ mod tests {
         assert_eq!(
             call(addr, "POST", "/v1/systemone", "X-API-Key: s3cre\r\n", REQ).0,
             401
+        );
+        assert_eq!(call(addr, "POST", "/v1/rerank", "", RERANK_REQ).0, 401);
+        assert_eq!(
+            call(
+                addr,
+                "POST",
+                "/v1/rerank",
+                "X-API-Key: s3cret\r\n",
+                RERANK_REQ
+            )
+            .0,
+            200
         );
         // Health never needs a key by default so a client can probe before configuring one.
         assert_eq!(call(addr, "GET", "/health", "", "").0, 200);
@@ -871,6 +1114,9 @@ mod tests {
         );
         assert_eq!(status, 200);
         assert_eq!(body["choices"][0]["message"]["content"], "hello");
+        let (status, body) = call(addr, "POST", "/web/rerank", "", RERANK_REQ);
+        assert_eq!(status, 200);
+        assert_eq!(body["results"][0]["index"], 2);
         // The programmatic API still needs the key.
         assert_eq!(call(addr, "POST", "/v1/systemone", "", REQ).0, 401);
         assert_eq!(
@@ -898,6 +1144,7 @@ mod tests {
             .0,
             401
         );
+        assert_eq!(call(addr, "POST", "/web/rerank", "", RERANK_REQ).0, 401);
         assert_eq!(call(addr, "GET", "/web/session", "", "").0, 401);
         assert_eq!(
             call(addr, "POST", "/web/login", "", r#"{"password":"wrong"}"#).0,
@@ -928,6 +1175,10 @@ mod tests {
                 r#"{"messages":[{"role":"user","content":"hi"}]}"#
             )
             .0,
+            200
+        );
+        assert_eq!(
+            call(addr, "POST", "/web/rerank", &cookie, RERANK_REQ).0,
             200
         );
         assert_eq!(call(addr, "GET", "/web/info", &cookie, "").0, 200);

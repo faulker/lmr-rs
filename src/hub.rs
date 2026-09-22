@@ -23,6 +23,7 @@ const TOKENIZER_CONFIG: &str = "tokenizer/tokenizer_config.json";
 const WEIGHTS: &str = "model.safetensors";
 const GGUF_TOKENIZER: &str = "tokenizer.json";
 const GGUF_TOKENIZER_CONFIG: &str = "tokenizer_config.json";
+const RERANK_CONFIG: &str = "config.json";
 
 /// Local paths of a GGUF chat checkpoint plus its Hugging Face tokenizer.
 #[derive(Debug, Clone)]
@@ -34,11 +35,23 @@ pub struct GgufFiles {
     pub tokenizer_config: Option<PathBuf>,
 }
 
-/// Either a Laya decision checkpoint or a GGUF chat model.
+/// Local paths of a cross-encoder reranker (HF `config.json` + safetensors).
+#[derive(Debug, Clone)]
+pub struct RerankFiles {
+    /// Human readable id, e.g. `BAAI/bge-reranker-v2-m3` or a directory path.
+    pub id: String,
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub tokenizer_config: Option<PathBuf>,
+    pub weights: PathBuf,
+}
+
+/// A Laya decision checkpoint, a GGUF chat model, or a reranker.
 #[derive(Debug, Clone)]
 pub enum ModelFiles {
     Laya(CheckpointFiles),
     Gguf(GgufFiles),
+    Rerank(RerankFiles),
 }
 
 impl ModelFiles {
@@ -47,6 +60,7 @@ impl ModelFiles {
         match self {
             Self::Laya(f) => &f.id,
             Self::Gguf(f) => &f.id,
+            Self::Rerank(f) => &f.id,
         }
     }
 
@@ -55,6 +69,7 @@ impl ModelFiles {
         match self {
             Self::Laya(f) => &f.weights,
             Self::Gguf(f) => &f.weights,
+            Self::Rerank(f) => &f.weights,
         }
     }
 }
@@ -124,7 +139,55 @@ fn fetch_model_inner(spec: &ResolvedModel, force: bool) -> Result<ModelFiles> {
             tokenizer_repo,
             force,
         )?)),
+        ResolvedModel::Rerank { repo } => Ok(ModelFiles::Rerank(fetch_rerank_inner(repo, force)?)),
     }
+}
+
+/// Download (or open) a reranker: `config.json`, `tokenizer.json`, `model.safetensors`.
+pub fn fetch_rerank(repo: &str) -> Result<RerankFiles> {
+    fetch_rerank_inner(repo, false)
+}
+
+fn fetch_rerank_inner(model: &str, force: bool) -> Result<RerankFiles> {
+    let local = Path::new(model);
+    if local.is_dir() {
+        if force {
+            bail!("local checkpoints are not updated from Hugging Face");
+        }
+        return rerank_from_dir(local);
+    }
+    let repo = hf_model(model)?;
+    let config = download(&repo, RERANK_CONFIG, model, force, true)?;
+    let tokenizer = download(&repo, GGUF_TOKENIZER, model, force, true)?;
+    let tokenizer_config = download_optional(&repo, GGUF_TOKENIZER_CONFIG, model, force)?;
+    let weights = download(&repo, WEIGHTS, model, force, true)?;
+    Ok(RerankFiles {
+        id: model.to_string(),
+        config,
+        tokenizer,
+        tokenizer_config,
+        weights,
+    })
+}
+
+/// Use a reranker that is already on disk, laid out like the HF repo.
+fn rerank_from_dir(dir: &Path) -> Result<RerankFiles> {
+    let need = |file: &str| -> Result<PathBuf> {
+        let p = dir.join(file);
+        if p.is_file() {
+            Ok(p)
+        } else {
+            bail!("missing {}", p.display())
+        }
+    };
+    let tokenizer_config = dir.join(GGUF_TOKENIZER_CONFIG);
+    Ok(RerankFiles {
+        id: dir.display().to_string(),
+        config: need(RERANK_CONFIG)?,
+        tokenizer: need(GGUF_TOKENIZER)?,
+        tokenizer_config: tokenizer_config.is_file().then_some(tokenizer_config),
+        weights: need(WEIGHTS)?,
+    })
 }
 
 /// Resolve `model` (an HF repo id or a local directory) and an optional subfolder, downloading
@@ -429,6 +492,11 @@ fn planned_files(spec: &ResolvedModel) -> Result<PlannedFiles> {
                 optional: Vec::new(),
             })
         }
+        ResolvedModel::Rerank { repo } => Ok(PlannedFiles {
+            repo: repo.clone(),
+            required: vec![RERANK_CONFIG.into(), GGUF_TOKENIZER.into(), WEIGHTS.into()],
+            optional: vec![GGUF_TOKENIZER_CONFIG.into()],
+        }),
     }
 }
 
@@ -439,6 +507,7 @@ fn spec_is_local(spec: &ResolvedModel) -> bool {
             let p = Path::new(repo);
             p.is_file() || p.is_dir()
         }
+        ResolvedModel::Rerank { repo } => Path::new(repo).is_dir(),
     }
 }
 
@@ -452,6 +521,7 @@ fn local_status(spec: &ResolvedModel) -> Result<CacheStatus> {
             filename,
             tokenizer_repo,
         } => fetch_gguf(repo, filename, tokenizer_repo).err(),
+        ResolvedModel::Rerank { repo } => rerank_from_dir(Path::new(repo)).err(),
     };
     if missing.is_some() {
         return Ok(CacheStatus {
@@ -481,6 +551,10 @@ fn local_status(spec: &ResolvedModel) -> Result<CacheStatus> {
                 paths.push(cfg);
             }
             unique_paths_size(&paths)
+        }
+        ResolvedModel::Rerank { repo } => {
+            let files = planned_files(spec)?;
+            unique_size(Path::new(repo), &files.required)
         }
     };
     Ok(CacheStatus {
@@ -730,6 +804,49 @@ mod tests {
         assert!(files.tokenizer.ends_with("tokenizer.json"));
         assert!(files.tokenizer_config.is_none());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_rerank_dir_needs_config_tokenizer_and_weights() {
+        let dir = tmp("local-rerank");
+        assert!(fetch_rerank(dir.to_str().unwrap()).is_err());
+        fs::write(dir.join(RERANK_CONFIG), b"{}").unwrap();
+        fs::write(dir.join(GGUF_TOKENIZER), b"{}").unwrap();
+        assert!(fetch_rerank(dir.to_str().unwrap()).is_err());
+        fs::write(dir.join(WEIGHTS), b"w").unwrap();
+        let files = fetch_rerank(dir.to_str().unwrap()).unwrap();
+        assert!(files.weights.ends_with(WEIGHTS));
+        assert!(files.tokenizer_config.is_none());
+        let spec = ResolvedModel::Rerank {
+            repo: dir.to_str().unwrap().into(),
+        };
+        let st = cache_status_in(&dir, &spec).unwrap();
+        assert!(st.downloaded);
+        assert_eq!(st.source, CacheSource::Local);
+        assert!(delete_model_in(&dir, &spec).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_rerank_is_found_and_deleted() {
+        let cache = tmp("hf-rerank");
+        let repo = "BAAI/bge-reranker-v2-m3";
+        for (file, body) in [
+            (RERANK_CONFIG, b"cfg" as &[u8]),
+            (GGUF_TOKENIZER, b"tok"),
+            (GGUF_TOKENIZER_CONFIG, b"{}"),
+            (WEIGHTS, b"wwwwwwww"),
+        ] {
+            plant(&cache, repo, "ddd", file, body);
+        }
+        let spec = ResolvedModel::Rerank { repo: repo.into() };
+        let st = cache_status_in(&cache, &spec).unwrap();
+        assert!(st.downloaded);
+        assert_eq!(st.source, CacheSource::Hub);
+        let report = delete_model_in(&cache, &spec).unwrap();
+        assert_eq!(report.files, 4);
+        assert!(!cache_status_in(&cache, &spec).unwrap().downloaded);
+        fs::remove_dir_all(&cache).unwrap();
     }
 
     #[test]
